@@ -29,6 +29,21 @@ type remarkableConfig struct {
 	FolderID    string `env:"REMARKABLE_FOLDER_ID"`
 }
 
+type bookmarkRetry struct {
+	count int
+	next  time.Time
+}
+
+// backoffDuration returns an exponential backoff capped at 15 seconds.
+// count 0 -> 1s, count 3 -> 8s, count >= 4 -> 15s.
+func backoffDuration(count int) time.Duration {
+	d := time.Duration(1<<count) * time.Second
+	if d > 15*time.Second {
+		return 15 * time.Second
+	}
+	return d
+}
+
 func main() {
 	setup := flag.Bool("setup", false, "authenticate with reMarkable and print tokens")
 	listFolders := flag.Bool("list-folders", false, "list reMarkable folders with their IDs")
@@ -86,6 +101,8 @@ func main() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	retries := make(map[int]bookmarkRetry)
+
 	for range ticker.C {
 		list, err := ic.Unread("remarkable")
 		if err != nil {
@@ -99,9 +116,27 @@ func main() {
 
 		log.Printf("found %d unread remarkable bookmark(s)", len(list))
 
+		now := time.Now()
 		for _, b := range list {
+			state := retries[b.BookmarkID]
+			if state.count >= 10 {
+				log.Printf("error: giving up on %q after %d retries", b.Title, state.count)
+				delete(retries, b.BookmarkID)
+				continue
+			}
+			if now.Before(state.next) {
+				log.Printf("skipping %q: backing off until %s", b.Title, state.next.Format(time.RFC3339))
+				continue
+			}
+
 			if err := processBookmark(ic, rm, folderID, b); err != nil {
-				log.Printf("process bookmark %q: %v", b.Title, err)
+				log.Printf("process bookmark %q (attempt %d): %v", b.Title, state.count+1, err)
+				retries[b.BookmarkID] = bookmarkRetry{
+					count: state.count + 1,
+					next:  now.Add(backoffDuration(state.count)),
+				}
+			} else {
+				delete(retries, b.BookmarkID)
 			}
 		}
 	}

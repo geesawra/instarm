@@ -4,6 +4,7 @@
 package remarkable
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
@@ -23,7 +24,10 @@ type Config struct {
 
 // Client is a thin wrapper around rmapi's ApiCtx.
 type Client struct {
-	ctx api.ApiCtx
+	ctx         api.ApiCtx
+	httpCtx     *transport.HttpClientCtx
+	deviceToken string
+	syncVersion api.SyncVersion
 }
 
 // Authenticate exchanges a one-time code from
@@ -85,7 +89,26 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("create rmapi context: %w", err)
 	}
 
-	return &Client{ctx: ctx}, nil
+	return &Client{
+		ctx:         ctx,
+		httpCtx:     &httpCtx,
+		deviceToken: cfg.DeviceToken,
+		syncVersion: userInfo.SyncVersion,
+	}, nil
+}
+
+// refresh exchanges the stored device token for a new user token and updates
+// the HTTP context used by subsequent API calls.
+func (c *Client) refresh() error {
+	if c.deviceToken == "" {
+		return fmt.Errorf("device token is missing")
+	}
+	newUserToken, err := refreshUserToken(c.httpCtx)
+	if err != nil {
+		return fmt.Errorf("refresh user token: %w", err)
+	}
+	c.httpCtx.Tokens.UserToken = newUserToken
+	return nil
 }
 
 // Folder represents a reMarkable directory.
@@ -157,10 +180,20 @@ func (c *Client) ResolveFolderID(input string) (string, error) {
 }
 
 // UploadDocument uploads the file at path to the reMarkable folder identified
-// by folderID. An empty folderID uploads to the root.
+// by folderID. An empty folderID uploads to the root. If the upload fails
+// because the user token expired, the token is refreshed and the upload is
+// retried once.
 func (c *Client) UploadDocument(path, folderID string) error {
 	if _, err := c.ctx.UploadDocument(folderID, path, true, nil, nil, nil, nil); err != nil {
-		return fmt.Errorf("upload %q: %w", path, err)
+		if !errors.Is(err, transport.ErrUnauthorized) {
+			return fmt.Errorf("upload %q: %w", path, err)
+		}
+		if refreshErr := c.refresh(); refreshErr != nil {
+			return fmt.Errorf("upload %q: 401 unauthorized and token refresh failed: %w", path, refreshErr)
+		}
+		if _, err := c.ctx.UploadDocument(folderID, path, true, nil, nil, nil, nil); err != nil {
+			return fmt.Errorf("upload %q after token refresh: %w", path, err)
+		}
 	}
 	return nil
 }
